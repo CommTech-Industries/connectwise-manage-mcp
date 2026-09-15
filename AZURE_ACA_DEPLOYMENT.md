@@ -29,6 +29,154 @@ Both paths converge at Phase 7. Only the image reference differs.
 
 ---
 
+## CommTech Existing-App Upgrade Runbook
+
+Use this runbook for the company fork that replaces the public image on the
+existing Container App without changing its endpoint, ingress, environment
+variables, or Key Vault secret references.
+
+```powershell
+$RESOURCE_GROUP = "rg-ct-connectwise-mcp"
+$ACA_APP_NAME = "cwm-mcp"
+$ACR_NAME = "commtechcwmcpacr"
+$IMAGE_REPOSITORY = "connectwise-manage-mcp"
+$IMAGE_TAG = "1.8.8-commtech.1"
+$IMAGE_REF = "$ACR_NAME.azurecr.io/${IMAGE_REPOSITORY}:$IMAGE_TAG"
+
+# Read deployment metadata only. Do not query environment-variable or secret values.
+$APP_LOCATION = az containerapp show `
+  --name $ACA_APP_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --query location `
+  --output tsv
+
+$REVISION_MODE = az containerapp show `
+  --name $ACA_APP_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --query properties.configuration.activeRevisionsMode `
+  --output tsv
+
+$OLD_REVISION = az containerapp revision list `
+  --name $ACA_APP_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --query "[?properties.active].name | [0]" `
+  --output tsv
+
+$OLD_IMAGE = az containerapp revision show `
+  --revision $OLD_REVISION `
+  --resource-group $RESOURCE_GROUP `
+  --query properties.template.containers[0].image `
+  --output tsv
+
+az containerapp show `
+  --name $ACA_APP_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --query "{fqdn:properties.configuration.ingress.fqdn,targetPort:properties.configuration.ingress.targetPort,external:properties.configuration.ingress.external,envNames:properties.template.containers[0].env[].name}" `
+  --output json
+```
+
+If multiple revisions are active, capture the complete traffic map and identify
+the revision actually receiving production traffic rather than relying on the
+first active revision. Keep that snapshot for rollback.
+
+Check the globally unique registry name, then create an admin-disabled Basic
+registry in the app's existing location:
+
+```powershell
+az acr check-name --name $ACR_NAME
+
+az acr create `
+  --name $ACR_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --location $APP_LOCATION `
+  --sku Basic `
+  --admin-enabled false `
+  --role-assignment-mode rbac
+
+az acr build `
+  --registry $ACR_NAME `
+  --image "${IMAGE_REPOSITORY}:$IMAGE_TAG" `
+  --file Dockerfile `
+  .
+```
+
+Record the pushed manifest digest and never reuse `$IMAGE_TAG`. Use the
+Container App's system-assigned identity for image pull, enabling it if it does
+not already exist. No registry password is created or stored.
+
+```powershell
+$APP_PRINCIPAL_ID = az containerapp identity assign `
+  --name $ACA_APP_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --system-assigned `
+  --query principalId `
+  --output tsv
+
+$ACR_RESOURCE_ID = az acr show `
+  --name $ACR_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --query id `
+  --output tsv
+
+az role assignment create `
+  --assignee-object-id $APP_PRINCIPAL_ID `
+  --assignee-principal-type ServicePrincipal `
+  --role AcrPull `
+  --scope $ACR_RESOURCE_ID
+
+az containerapp registry set `
+  --name $ACA_APP_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --server "$ACR_NAME.azurecr.io" `
+  --identity system
+
+az containerapp revision copy `
+  --name $ACA_APP_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --from-revision $OLD_REVISION `
+  --image $IMAGE_REF `
+  --revision-suffix "ct18801"
+```
+
+Do not pass environment-variable, secret, ingress, hostname, port, compute, or
+scale arguments to `revision copy`. In single-revision mode, ACA keeps the old
+revision serving until the new revision is ready. In multiple-revision mode,
+keep the captured production traffic map while validating the new revision,
+then explicitly direct traffic to it with `az containerapp ingress traffic set`.
+
+Validate the unchanged `/health` and `/mcp` endpoints, MCP initialization and
+tool discovery, and the two new ticket workflow tools. In Copilot Studio, edit
+the existing MCP server entry so it refreshes tool discovery. If **Allow all**
+is disabled, explicitly enable `cw_set_ticket_status` and
+`cw_add_internal_note_and_set_status`. Test with a designated noncritical
+ticket before publishing the updated child-agent instructions.
+
+For rollback, retain `$OLD_REVISION`, `$OLD_IMAGE`, and the original traffic map.
+In single-revision mode, copy the exact previous revision:
+
+```powershell
+az containerapp revision copy `
+  --name $ACA_APP_NAME `
+  --resource-group $RESOURCE_GROUP `
+  --from-revision $OLD_REVISION `
+  --revision-suffix "rollback180"
+```
+
+For an emergency reactivation, run:
+
+```powershell
+az containerapp revision activate `
+  --resource-group $RESOURCE_GROUP `
+  --revision $OLD_REVISION
+```
+
+In multiple-revision mode, restore the captured traffic weights. Refresh the
+Copilot Studio MCP entry and republish the prior child-agent version after
+rollback. Do not delete either revision or image until rollback verification is
+complete.
+
+---
+
 ## Architecture
 
 ```
@@ -364,20 +512,22 @@ $KV_URI_LOG_LEVEL     = az keyvault secret show --vault-name $KEYVAULT_NAME --na
 Use this path if you are deploying a fork with custom changes.
 
 ```powershell
+$IMAGE_TAG = "1.8.8-commtech.1" # Increment for every immutable company build
+
 # Authenticate Docker to ACR using your Azure login (no admin password needed)
 az acr login --name $ACR_NAME
 
 # Build from the repo root
-docker build -t "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest" .
+docker build -t "$ACR_LOGIN_SERVER/connectwise-manage-mcp:$IMAGE_TAG" .
 
 # Push to ACR
-docker push "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest"
+docker push "$ACR_LOGIN_SERVER/connectwise-manage-mcp:$IMAGE_TAG"
 
 # Verify the image is there
 az acr repository list --name $ACR_NAME --output table
 
 # Set the image reference variable used in Phase 7
-$IMAGE_REF = "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest"
+$IMAGE_REF = "$ACR_LOGIN_SERVER/connectwise-manage-mcp:$IMAGE_TAG"
 ```
 
 ### Path B — Use Upstream GHCR Image (no ACR required)
@@ -385,8 +535,9 @@ $IMAGE_REF = "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest"
 Use this path if you are deploying the unmodified upstream image. No Docker build needed; skip the ACR steps in Phases 2 and 3 as well.
 
 ```powershell
-# Set the image reference variable used in Phase 7
-$IMAGE_REF = "ghcr.io/wyre-ai/connectwise-manage-mcp:latest"
+# Set an explicit immutable release used in Phase 7
+$UPSTREAM_VERSION = "v1.8.8"
+$IMAGE_REF = "ghcr.io/wyre-ai/connectwise-manage-mcp:$UPSTREAM_VERSION"
 ```
 
 > **Note:** If your fork's changes are merged upstream, you can switch from Path A to Path B and decommission ACR entirely.
@@ -692,24 +843,26 @@ az containerapp logs show `
 cd /path/to/connectwise-manage-mcp
 git pull
 
+$IMAGE_TAG = "1.8.8-commtech.1" # Never reuse an existing tag
 az acr login --name $ACR_NAME
-docker build -t "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest" .
-docker push "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest"
+docker build -t "$ACR_LOGIN_SERVER/connectwise-manage-mcp:$IMAGE_TAG" .
+docker push "$ACR_LOGIN_SERVER/connectwise-manage-mcp:$IMAGE_TAG"
 
 az containerapp update `
   --name $ACA_APP_NAME `
   --resource-group $RESOURCE_GROUP `
-  --image "$ACR_LOGIN_SERVER/connectwise-manage-mcp:latest"
+  --image "$ACR_LOGIN_SERVER/connectwise-manage-mcp:$IMAGE_TAG"
 ```
 
 ### Update to a New Image Version (Path B)
 
 ```powershell
-# Force ACA to pull the latest GHCR image by triggering a new revision
+$UPSTREAM_VERSION = "v1.8.8"
+# Deploy an explicit upstream release by triggering a new revision
 az containerapp update `
   --name $ACA_APP_NAME `
   --resource-group $RESOURCE_GROUP `
-  --image "ghcr.io/wyre-ai/connectwise-manage-mcp:latest"
+  --image "ghcr.io/wyre-ai/connectwise-manage-mcp:$UPSTREAM_VERSION"
 ```
 
 ### Rotate ConnectWise API Keys
@@ -845,14 +998,17 @@ Azure occasionally resets this during manifest edits. If token issuer validation
 
 ### ConnectWise API Returns 401
 
-Verify the credentials stored in Key Vault are correct:
+Verify that the credential secrets exist and are enabled without displaying
+their values:
 
 ```powershell
-az keyvault secret show --vault-name $KEYVAULT_NAME --name "CW-PUBLIC-KEY"  --query value --output tsv
-az keyvault secret show --vault-name $KEYVAULT_NAME --name "CW-COMPANY-ID"  --query value --output tsv
+az keyvault secret show --vault-name $KEYVAULT_NAME --name "CW-PUBLIC-KEY"  --query "{id:id,enabled:attributes.enabled,updated:attributes.updated}" --output json
+az keyvault secret show --vault-name $KEYVAULT_NAME --name "CW-COMPANY-ID"  --query "{id:id,enabled:attributes.enabled,updated:attributes.updated}" --output json
 ```
 
-Also confirm the API member exists and is active in CWM under **Members → API Members**, and that the Client ID matches what is registered at `developer.connectwise.com`.
+If the metadata is correct, verify the API member and Client ID directly in
+their administrative portals. Never print ConnectWise credential values to a
+terminal or deployment log.
 
 ---
 

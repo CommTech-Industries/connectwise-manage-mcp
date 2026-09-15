@@ -2,6 +2,38 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CwManageClient } from "../api-client.js";
 import { buildTicketCard, TICKET_CARD_META } from "../card.builder.js";
+import {
+  addInternalNoteAndSetStatus,
+  setTicketStatus,
+} from "../services/ticket-workflow.js";
+
+const referenceSchema = z.object({
+  id: z.number().int(),
+  name: z.string(),
+});
+
+const operationErrorSchema = z.object({
+  stage: z.enum([
+    "initial_ticket_read",
+    "status_resolution",
+    "initial_note_read",
+    "note_create",
+    "status_patch",
+    "ticket_verification",
+    "note_verification",
+  ]),
+  code: z.string(),
+  message: z.string(),
+  httpStatus: z.number().int().optional(),
+});
+
+function structuredToolResult(result: Record<string, unknown> & { success: boolean }) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+    structuredContent: result,
+    isError: !result.success,
+  };
+}
 
 export function registerTicketTools(server: McpServer, client: CwManageClient) {
   server.tool(
@@ -85,7 +117,7 @@ export function registerTicketTools(server: McpServer, client: CwManageClient) {
 
   server.tool(
     "cw_update_ticket",
-    "Update an existing service ticket using JSON Patch operations.",
+    "Update an existing service ticket using JSON Patch operations. For status-only changes, prefer cw_set_ticket_status so the server resolves and verifies the board-specific status without client-supplied patch fields.",
     {
       id: z.number().describe("Ticket ID"),
       operations: z
@@ -101,6 +133,104 @@ export function registerTicketTools(server: McpServer, client: CwManageClient) {
     async ({ id, operations }) => {
       const result = await client.patch(`/service/tickets/${id}`, operations);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.registerTool(
+    "cw_set_ticket_status",
+    {
+      title: "Set ConnectWise ticket status",
+      description:
+        "Preferred tool for status-only ticket changes. Resolves one exact active status on the ticket's current service board, constructs the JSON Patch internally, and reads the ticket back to verify the resulting status.",
+      inputSchema: {
+        ticketId: z.number().int().positive().describe("Ticket ID"),
+        statusName: z
+          .string()
+          .trim()
+          .min(1)
+          .describe("Exact status name on the ticket's current service board"),
+      },
+      outputSchema: {
+        success: z.boolean(),
+        outcome: z.enum(["updated", "already_correct", "failed"]),
+        ticketId: z.number().int(),
+        board: referenceSchema.nullable(),
+        previousStatus: referenceSchema.nullable(),
+        requestedStatus: z.string(),
+        resolvedStatus: referenceSchema.nullable(),
+        statusUpdateAttempted: z.boolean(),
+        statusChanged: z.boolean(),
+        verifiedStatus: referenceSchema.nullable(),
+        errors: z.array(operationErrorSchema),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async ({ ticketId, statusName }) => {
+      const result = await setTicketStatus(client, ticketId, statusName);
+      return structuredToolResult(result as unknown as Record<string, unknown> & { success: boolean });
+    },
+  );
+
+  server.registerTool(
+    "cw_add_internal_note_and_set_status",
+    {
+      title: "Add internal note and set ConnectWise ticket status",
+      description:
+        "Preferred unattended finalization tool. Idempotently adds one internal-only note, resolves one exact active status on the ticket's current service board, updates the status, and reads both ticket and notes back before reporting success.",
+      inputSchema: {
+        ticketId: z.number().int().positive().describe("Ticket ID"),
+        internalNote: z
+          .string()
+          .refine((value) => value.trim().length > 0, "Internal note must not be blank")
+          .describe("Internal-only ticket note; formatting is preserved"),
+        statusName: z
+          .string()
+          .trim()
+          .min(1)
+          .describe("Exact status name on the ticket's current service board"),
+      },
+      outputSchema: {
+        success: z.boolean(),
+        outcome: z.enum([
+          "completed",
+          "already_complete",
+          "partial_failure",
+          "failed",
+        ]),
+        ticketId: z.number().int(),
+        board: referenceSchema.nullable(),
+        noteAdded: z.boolean(),
+        noteAlreadyExisted: z.boolean(),
+        noteVerified: z.boolean(),
+        noteId: z.number().int().nullable(),
+        previousStatus: referenceSchema.nullable(),
+        requestedStatus: z.string(),
+        resolvedStatus: referenceSchema.nullable(),
+        statusUpdateAttempted: z.boolean(),
+        statusChanged: z.boolean(),
+        verifiedStatus: referenceSchema.nullable(),
+        errors: z.array(operationErrorSchema),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async ({ ticketId, internalNote, statusName }) => {
+      const result = await addInternalNoteAndSetStatus(
+        client,
+        ticketId,
+        internalNote,
+        statusName,
+      );
+      return structuredToolResult(result as unknown as Record<string, unknown> & { success: boolean });
     },
   );
 

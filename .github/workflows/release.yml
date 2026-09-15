@@ -15,6 +15,9 @@ on:
 # only reduce, never expand, caller-granted scope).
 jobs:
   release:
+    # This reusable publisher targets WYRE-owned package/image namespaces.
+    # Company forks build their deployment images in their own registry.
+    if: github.repository == 'WYRE-AI/connectwise-manage-mcp'
     permissions:
       contents: write
       issues: write

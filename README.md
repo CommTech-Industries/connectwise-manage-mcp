@@ -80,9 +80,25 @@ needed.
 - `cw_search_tickets` — Search service tickets with conditions
 - `cw_get_ticket` — Get a ticket by ID
 - `cw_create_ticket` — Create a new service ticket
-- `cw_update_ticket` — Update a ticket (JSON Patch)
+- `cw_update_ticket` — Update a ticket (JSON Patch; retained for legacy clients)
+- `cw_set_ticket_status` — Preferred status-only update; resolves the exact status on the ticket's board and verifies the result
 - `cw_get_ticket_notes` — Get all notes on a ticket (including child ticket notes)
 - `cw_add_ticket_note` — Add a note to a ticket (discussion, internal, or resolution)
+- `cw_add_internal_note_and_set_status` — Idempotently add an internal note, set a board-valid status, and verify both results
+
+### Unattended Ticket Finalization
+
+Use `cw_add_internal_note_and_set_status` when an automated workflow must add
+an internal note and move a ticket as one retry-safe operation. The tool resolves
+the requested status only against the ticket's current service board, adds an
+internal-only note with a deterministic idempotency marker, applies the status
+patch internally, and reads both the ticket and its notes back before reporting
+success. A retry with the same ticket ID, status name, and exact note text does
+not create another note.
+
+Use `cw_set_ticket_status` for ordinary status-only changes. Do not use
+`cw_update_ticket` for status-only work unless a legacy client specifically
+requires generic JSON Patch input.
 
 ### Companies
 - `cw_search_companies` — Search companies
